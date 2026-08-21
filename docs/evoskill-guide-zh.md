@@ -218,6 +218,89 @@ return score / len(results)   # 程序准确率
 | `script` | 外部 shell 脚本 | `command` |
 | `harbor` | 解 Harbor 容器的 reward JSON | — |
 
+### Scorer 场景、输入与示例
+
+scorer 的输入统一是「问题 + 预测答案 + 标准答案」三个字符串(个别例外),区别在于**场景**和**怎么比**。
+
+| scorer | 场景 | 输入签名 |
+|--------|------|---------|
+| `multi_tolerance` | 通用数值问答(带单位/容差) | `(question, predicted, ground_truth)` |
+| `exact` | 答案需完全一致 | `(question, predicted, ground_truth)` |
+| `llm` | 语义/开放问答 | `(question, predicted, ground_truth)` |
+| `script` | 自定义复杂判定 | `(question, predicted, ground_truth)` |
+| `harbor` | 容器化 benchmark | `(question, predicted, ground_truth)` |
+| `sealqa` | SEAL-QA 多跳问答 | `(question, ground_truth, predicted)` ⚠️ 顺序不同 |
+| `dabstep` | 表格问答 | `(input1, input2)` ⚠️ 仅两个参数 |
+| `livecodebench` | 代码生成(跑测试) | `(question, ground_truth, predicted)` |
+
+**multi_tolerance(默认)** — 数值问答,答案常带数量级单位或需容忍小误差。
+
+```
+question     = "What was revenue in Q3?"
+ground_truth = "4.2 billion"
+predicted    = "$4.2B"          → 数字 4.2 命中、单位 billion 命中 → 1.0
+predicted    = "4.19 billion"   → 1% 容差内 → 0.70
+predicted    = "4.5 billion"    → 超出 10% → 0.0
+```
+
+**exact** — 答案必须一字不差(大小写不敏感)。
+
+```
+ground_truth = "Paris"
+predicted    = "paris"          → 1.0
+predicted    = "Paris, France"  → 0.0
+```
+
+**llm** — 语义/开放答案,用模型按 `rubric` 打分。
+
+```
+rubric       = "Award 1.0 if the answer is semantically correct, else 0.0"
+question     = "What city is OpenAI headquartered in?"
+ground_truth = "San Francisco, California"
+predicted    = "San Francisco"  → LLM 判正确 → 1.0
+```
+
+**script** — 需跑代码/调外部工具,通过 `{predicted}`/`{expected}` 占位符传入。
+
+```toml
+[scorer]
+type = "script"
+command = "python score.py --predicted {predicted} --expected {expected}"
+```
+
+**harbor** — 容器化 benchmark,`predicted` 是 JSON 信封,`ground_truth` 被忽略。
+
+```
+predicted = '{"reward": 0.85, "metric": "reward.txt", "exit_status": "verified"}'
+→ json.loads 解出 reward → 0.85
+```
+
+**sealqa** — SEAL-QA 多跳问答,`dspy` + LLM 判 CORRECT/INCORRECT/NOT_ATTEMPTED。⚠️ 顺序 `(question, ground_truth, predicted)`。
+
+```
+question     = "What are the names of Barack Obama's children?"
+ground_truth = "Malia and Sasha"
+predicted    = "sasha and malia obama"   → CORRECT → 1.0
+```
+
+**dabstep** — 表格问答,处理千分位逗号数字、列表、文本。⚠️ 仅 `(input1, input2)`。
+
+```python
+question_scorer("1,000,000", "1000000")   # 去逗号比较 → True
+question_scorer("[a, b, c]", "[c, b, a]") # 列表排序后相等 → True
+question_scorer("United States", "USA")   # SequenceMatcher < 0.95 → False
+```
+
+**livecodebench** — 代码生成,在容器跑代码看测试是否通过。
+
+```
+predicted    = "```python\ndef add(a,b): return a+b\n```"
+ground_truth = '[{"input":"1,2","output":"3"}]'
+→ 跑代码,stdout "3" 匹配 → 1.0
+```
+
+**选型速查**:数值/单位 → `multi_tolerance`;必须一致 → `exact`;语义开放 → `llm`;特殊逻辑 → `script`;表格数字/列表 → `dabstep`;容器 verifier → `harbor`。
+
 ## 2.4 核心算法:reward.py 模糊匹配
 
 文件 `src/evaluation/reward.py`,是 `multi_tolerance` 与 `exact` 之外的通用引擎,处理「数字 + 单位 + 文本」混合答案。入口 `score_answer(gt, pred, tolerance)` → `fuzzy_match_answer(...)`,返回 0 或 1。
