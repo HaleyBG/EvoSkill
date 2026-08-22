@@ -415,6 +415,211 @@ weight = 1.0 / (1.0 + 20.0 * tol)   # 越严格(tol 越小)权重越高
 - `llm` / `script` 可产出**真正连续**的 0~1 分,粒度更细,适合需要按「接近程度」排序的场景。
 - 连续分的粒度会直接影响 frontier 排序与早停判断:若大多数程序都落在同一离散档位,排序退化为并列,进化信号变弱。
 
+### 2.10 常见 Scorer 源码
+
+以下源码均从仓库现行代码中摘录,作为 2.1~2.9 分析的对照。每个片段标注来源文件,便于跳转核对。
+
+#### 2.10.1 `make_scorer` 工厂(`src/cli/shared.py:185`)
+
+五种 scorer 类型在此分发。默认兜底回落到 `_score_multi_tolerance`。
+
+```python
+def make_scorer(cfg: ProjectConfig):
+    from src.loop.runner import _score_multi_tolerance
+
+    if cfg.scorer.type == "harbor":
+        from src.evaluation.harbor_scorer import harbor_reward_scorer
+        return harbor_reward_scorer
+
+    if cfg.scorer.type == "exact":
+
+        def exact(question: str, predicted: str, ground_truth: str) -> float:
+            return (
+                1.0
+                if str(predicted).strip().lower()
+                == str(ground_truth).strip().lower()
+                else 0.0
+            )
+
+        return exact
+
+    if cfg.scorer.type == "multi_tolerance":
+        return _score_multi_tolerance
+
+    if cfg.scorer.type == "llm":
+        rubric = cfg.scorer.rubric or "Award 1.0 if correct, 0.0 if wrong."
+        model = cfg.scorer.model or "claude-sonnet-4-6"
+        provider = cfg.scorer.provider or infer_provider(model)
+
+        async def llm_score(question: str, predicted: str, ground_truth: str) -> float:
+            prompt = (
+                f"Question: {question}\n"
+                f"Expected: {ground_truth}\n"
+                f"Got: {predicted}\n\n"
+                f"Rubric: {rubric}\n\n"
+                "Reply with only a number between 0.0 and 1.0."
+            )
+            try:
+                text = await call_llm(provider, model, prompt)
+                return float(text.strip())
+            except ValueError:
+                import logging
+                logging.getLogger(__name__).warning(
+                    "LLM scorer: could not parse response as float: %r", text
+                )
+                return 0.0
+            except Exception as exc:
+                import logging
+                logging.getLogger(__name__).error(
+                    "LLM scorer failed (%s: %s) — returning 0.0",
+                    type(exc).__name__, exc,
+                )
+                return 0.0
+
+        def llm_scorer(question: str, predicted: str, ground_truth: str) -> float:
+            coro = llm_score(question, predicted, ground_truth)
+            try:
+                asyncio.get_running_loop()
+            except RuntimeError:
+                return asyncio.run(coro)
+            else:
+                import concurrent.futures
+                with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                    return pool.submit(asyncio.run, coro).result()
+
+        return llm_scorer
+
+    if cfg.scorer.type == "script":
+        import shlex
+        import subprocess
+
+        if not cfg.scorer.command:
+            raise ValueError(
+                "scorer.type is 'script' but scorer.command is not set in config.toml"
+            )
+
+        def script_scorer(question: str, predicted: str, ground_truth: str) -> float:
+            cmd = cfg.scorer.command.replace("{predicted}", predicted).replace("{expected}", ground_truth)
+            try:
+                result = subprocess.run(
+                    shlex.split(cmd), capture_output=True, text=True, timeout=30,
+                )
+            except subprocess.TimeoutExpired:
+                import logging
+                logging.getLogger(__name__).warning(
+                    "Script scorer timed out (30s): %s", cmd[:120],
+                )
+                return 0.0
+            try:
+                return float(result.stdout.strip())
+            except ValueError:
+                return 0.0
+
+        return script_scorer
+
+    return _score_multi_tolerance
+```
+
+#### 2.10.2 `multi_tolerance`(`src/loop/runner.py:29`)
+
+```python
+TOLERANCE_LEVELS = [0.05, 0.01, 0.1, 0.0, 0.025]
+
+def _score_multi_tolerance(question: str, predicted: str, ground_truth: str) -> float:
+    """Score answer using weighted average across tolerance levels.
+
+    Weights favor stricter tolerances: weight = 1 / (1 + 20 * tolerance)
+    """
+    if not str(predicted or "").strip():
+        return 0.0
+
+    weighted_sum = 0.0
+    weight_total = 0.0
+    for tol in TOLERANCE_LEVELS:
+        weight = 1.0 / (1.0 + 20.0 * tol)
+        score = score_answer(ground_truth, predicted, tol)
+        weighted_sum += weight * score
+        weight_total += weight
+    return weighted_sum / weight_total
+```
+
+#### 2.10.3 `score_answer` 入口(`src/evaluation/reward.py:439`)
+
+`score_answer` 只是 `fuzzy_match_answer` 的二值包装;真正的判定逻辑(数字抽取、单位归一、文本重叠、列表全匹配)都在 `fuzzy_match_answer` 内,详见 2.9.3。
+
+```python
+def score_answer(ground_truth: str, predicted: str, tolerance: float = 0.00) -> float:
+    """Score the answer using robust fuzzy matching."""
+    is_correct, rationale = fuzzy_match_answer(ground_truth, predicted, tolerance)
+    return 1.0 if is_correct else 0.0
+```
+
+#### 2.10.4 `harbor`(`src/evaluation/harbor_scorer.py:18`)
+
+解码 `HarborAgent` 写入 `final_answer` 的 JSON 信封,取 `reward` 字段;`ground_truth` 有意忽略。
+
+```python
+def harbor_reward_scorer(question: str, predicted: str, ground_truth: str) -> float:
+    if not predicted:
+        return 0.0
+    try:
+        envelope = json.loads(predicted)
+    except (TypeError, ValueError):
+        return 0.0
+    if not isinstance(envelope, dict):
+        return 0.0
+    raw = envelope.get("reward", 0.0)
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return 0.0
+```
+
+#### 2.10.5 SEAL-QA 的 `llm` 打分(`src/evaluation/sealqa_scorer.py:77`)
+
+用 DSPy 的 `ChainOfThought` 让模型输出 A/B/C 三档,只有 "A"(CORRECT)计 1.0。注意其参数顺序为 `(question, ground_truth, predicted)`,与统一签名 `(question, predicted, ground_truth)` 不一致。
+
+```python
+def score_sealqa(question: str, ground_truth: str, predicted: str) -> float:
+    lm = dspy.LM("openrouter/openai/gpt-5-mini")
+    system_prompt = GRADER_TEMPLATE.format(question=question, target=ground_truth, predicted_answer=predicted)
+
+    grader = dspy.ChainOfThought("question:str -> score:str")
+
+    with dspy.context(lm=lm):
+        response = grader(question=system_prompt)
+    score = 1.0 if response.score == "A" else 0.0
+    return score
+```
+
+#### 2.10.6 DABstep 的规则打分(`src/evaluation/dabstep_scorer.py:27`)
+
+`question_scorer` 只接受两个参数(无 `question`),按「带逗号数字 → 列表 → 纯数字 → 字符串」的优先级分派;`extract_numeric` / `compare_numeric` / `compare_lists` / `compare_strings` 为其底层判定。
+
+```python
+def question_scorer(input1: str, input2: str) -> bool:
+    input1 = input1.strip().lower()
+    input2 = input2.strip().lower()
+
+    if is_numeric_with_commas(input1) or is_numeric_with_commas(input2):
+        num1 = extract_numeric(input1)
+        num2 = extract_numeric(input2)
+        return compare_numeric(num1, num2) if num1 is not None and num2 is not None else False
+
+    if ';' in input1 or ';' in input2 or ',' in input1 or ',' in input2:
+        return compare_lists(input1, input2)
+
+    num1 = extract_numeric(input1)
+    num2 = extract_numeric(input2)
+
+    if num1 is not None and num2 is not None:
+        return compare_numeric(num1, num2)
+
+    return compare_strings(input1, input2)
+```
+
+> 签名不统一是现实存在的隐患:`score_sealqa` 是 `(question, ground_truth, predicted)`,`question_scorer` 是 `(input1, input2)`。只有走 `make_scorer` 工厂产出的 scorer 才严格遵循 `(question, predicted, ground_truth)` 统一签名。
+
 ---
 
 # 第三部分:扩展指南
